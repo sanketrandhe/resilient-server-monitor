@@ -1,0 +1,67 @@
+import boto3
+
+# -----------------------------
+# AWS clients in us-east-1
+# -----------------------------
+REGION = 'us-east-1'
+sns = boto3.client('sns', region_name=REGION)
+ec2 = boto3.client('ec2', region_name=REGION)
+elbv2 = boto3.client('elbv2', region_name=REGION)
+s3 = boto3.client('s3', region_name=REGION)
+
+# -----------------------------
+# Replace with your SNS Topic ARN
+# -----------------------------
+SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:011587325718:cost-alerts"
+
+def lambda_handler(event, context):
+    report = []
+
+    # 1. Stopped EC2 Instances
+    instances = ec2.describe_instances(
+        Filters=[{'Name': 'instance-state-name', 'Values': ['stopped']}]
+    )
+    for r in instances['Reservations']:
+        for i in r['Instances']:
+            report.append(f"Stopped EC2 Instance: {i['InstanceId']}")
+
+    # 2. Unattached Elastic IPs
+    addresses = ec2.describe_addresses()['Addresses']
+    for addr in addresses:
+        if 'InstanceId' not in addr:
+            report.append(f"Unattached Elastic IP: {addr['PublicIp']}")
+
+    # 3. NAT Gateways
+    nat_gws = ec2.describe_nat_gateways(
+        Filters=[{'Name':'state','Values':['available']}]
+    )['NatGateways']
+    for gw in nat_gws:
+        report.append(f"NAT Gateway Active: {gw['NatGatewayId']} (Costly)")
+
+    # 4. ALBs with no targets
+    load_balancers = elbv2.describe_load_balancers()['LoadBalancers']
+    for lb in load_balancers:
+        tgs = elbv2.describe_target_groups(LoadBalancerArn=lb['LoadBalancerArn'])['TargetGroups']
+        for tg in tgs:
+            health = elbv2.describe_target_health(TargetGroupArn=tg['TargetGroupArn'])
+            if not health['TargetHealthDescriptions']:
+                report.append(f"ALB with no targets: {lb['LoadBalancerName']}")
+
+    # 5. Empty S3 Buckets
+    buckets = s3.list_buckets()['Buckets']
+    for b in buckets:
+        objects = s3.list_objects_v2(Bucket=b['Name'])
+        if 'Contents' not in objects:
+            report.append(f"Empty S3 Bucket: {b['Name']}")
+
+    # Send SNS Alert
+    if report:
+        message = "\n".join(report)
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject="Idle AWS Resources Detected",
+            Message=message
+        )
+        return {"status": "alert sent", "details": report}
+    else:
+        return {"status": "all clear"}
